@@ -1,7 +1,7 @@
 use std::fmt::Display;
 use std::marker::PhantomData;
 use std::ops::Add;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use base58::ToBase58;
 use serde::{Deserialize, Serialize};
@@ -45,13 +45,15 @@ pub struct SessionData<A> {
     pub session_id: String,
 }
 
-pub fn hash_data(data: &[Vec<u8>]) -> Vec<u8> {
+pub fn hash_data(data: &[&[u8]]) -> Vec<u8> {
     let mut sha256 = sha2::Sha256::new();
     for d in data {
         sha256.update(d);
     }
     sha256.finalize().to_vec()
 }
+
+
 
 #[async_trait::async_trait]
 pub trait AccountStore<A: Account>: 'static + Send + Sync {
@@ -81,7 +83,7 @@ pub trait Captcha: 'static + Send + Sync {
 #[async_trait::async_trait]
 pub trait AccountManager<A: Account>: 'static + Send + Sync {
     #[cfg(feature = "login")]
-    async fn login(&self, account_name: &str, password: &str, salt: &[u8], captcha: Option<String>) -> AccountResult<(String, String)>;
+    async fn login(&self, account_name: &str, password: &str, timestamp: u64, captcha: Option<String>) -> AccountResult<(String, String)>;
     async fn refresh_session(&self, refresh_session: &str) -> AccountResult<(String, String)>;
     async fn decode_session(&self, session: &str) -> AccountResult<SessionData<A>>;
 }
@@ -96,6 +98,14 @@ impl<
     A: Account,
     Store: AccountStore<A>,
 > DefaultAccountManager<A, Store> {
+    pub fn new(store: Store, token_key: Vec<u8>) -> Arc<Self> {
+        Arc::new(Self {
+            store,
+            token_key,
+            _phantom_data: PhantomData,
+        })
+    }
+
     pub async fn create_account(&self, account: &A) -> AccountResult<A::Id> {
         if self.store.get_account_by_name(account.account_name()).await
             .map_err(into_account_err!(AccountErrorCode::AccountStoreError, "account {}", account.account_name()))?.is_some() {
@@ -139,7 +149,7 @@ impl<
         let refresh_session = JWTBuilder::new(session_data)
             .exp(Utc::now().add(Duration::from_secs(3600)))
             .sub("refresh".to_string())
-            .build(Algorithm::ES256, &EncodingKey::from_secret(self.token_key.as_slice()))
+            .build(Algorithm::HS256, &EncodingKey::from_secret(self.token_key.as_slice()))
             .map_err(into_account_err!(AccountErrorCode::Failed, "build jwt failed"))?;
         Ok((session, refresh_session))
     }
@@ -152,13 +162,14 @@ impl<
     Store: AccountStore<A>,
 > AccountManager<A> for DefaultAccountManager<A, Store> {
     #[cfg(feature = "login")]
-    async fn login(&self, account_name: &str, password: &str, salt: &[u8], _captcha: Option<String>) -> AccountResult<(String, String)> {
-        let account = self.store.get_account_by_name(account_name).await
-            .map_err(into_account_err!(AccountErrorCode::AccountStoreError, "get account {} failed", account_name))?
-            .ok_or(account_err!(AccountErrorCode::NotFound, "account {} not found", account_name))?;
-
-        if account.verify_password(password, salt) {
-            return Err(account_err!(AccountErrorCode::Failed, "account {} password error", account_name));
+    async fn login(&self, account_name: &str, password: &str, timestamp: u64, _captcha: Option<String>) -> AccountResult<(String, String)> {
+        let account = self.store.get_account_by_name(account_name).await?;
+        if account.is_none() {
+            return Err(account_err!(AccountErrorCode::InvalidAccount, "account {} not found", account_name));
+        }
+        let account = account.unwrap();
+        if !account.verify_password(password, format!("{}", timestamp).as_bytes()) {
+            return Err(account_err!(AccountErrorCode::InvalidPassword, "account {} password error", account_name));
         }
 
         let (session, refresh_session) = self.generate_session(account.clone())?;
@@ -171,7 +182,7 @@ impl<
         if token.sub.is_none() || token.sub.as_ref().unwrap() != "refresh" {
             return Err(account_err!(AccountErrorCode::SessionInvalid, "refresh token error"));
         }
-        if token.is_expire(Duration::from_secs(3600)) {
+        if token.is_expire() {
             return Err(account_err!(AccountErrorCode::SessionExpired, "session expired"));
         }
 
@@ -183,7 +194,7 @@ impl<
         let token: Payload<SessionData<A>> = JsonWebToken::decode_payload(session, &DecodingKey::from_secret(self.token_key.as_slice()))
             .map_err(into_account_err!(AccountErrorCode::SessionInvalid, "decode jwt failed"))?;
 
-        if token.is_expire(Duration::from_secs(3600)) {
+        if token.is_expire() {
             return Err(account_err!(AccountErrorCode::SessionExpired, "session expired"));
         }
 
